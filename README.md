@@ -1,2 +1,3 @@
 # Rust Learning
-> This is a private repo containing the official guide examples.
+
+Contains various rust experiments, whether from the Rust book or a random thought.

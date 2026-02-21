@@ -1,7 +1,6 @@
 [package]
 name = "more_or_less"
 version = "0.1.0"
-authors = ["Milo Moisson <milomoisson@gmail.com>"]
 edition = "2018"
 
 [dependencies]

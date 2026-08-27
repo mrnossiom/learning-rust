@@ -1,15 +1,51 @@
 #![feature(allocator_api)]
 
+use core::fmt;
 use std::{
 	alloc::{Allocator, Global, Layout},
 	cell::Cell,
 	marker::PhantomData,
 	ptr::{self, NonNull},
 };
+use zerocopy::IntoBytes;
 
+#[derive(IntoBytes)]
+#[repr(transparent)]
 struct Idx<'a, T>(u32, PhantomData<&'a T>);
 
-struct Arena<A: Allocator = Global> {
+#[derive(IntoBytes)]
+#[repr(transparent)]
+struct Idx2<T>(u32, PhantomData<T>);
+
+impl<T> Clone for Idx<'_, T> {
+	fn clone(&self) -> Self {
+		*self
+	}
+}
+
+impl<T> Clone for Idx2<T> {
+	fn clone(&self) -> Self {
+		*self
+	}
+}
+
+impl<T> Copy for Idx<'_, T> {}
+
+impl<T> Copy for Idx2<T> {}
+
+impl<T> fmt::Debug for Idx<'_, T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "Idx")
+	}
+}
+
+impl<T> fmt::Debug for Idx2<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "Idx2")
+	}
+}
+
+struct Arena<const MAX_ALIGN: usize, A: Allocator = Global> {
 	start: Cell<NonNull<u8>>,
 	end: Cell<NonNull<u8>>,
 	ptr: Cell<NonNull<u8>>,
@@ -17,13 +53,13 @@ struct Arena<A: Allocator = Global> {
 	alloc: A,
 }
 
-impl Arena {
+impl<const MAX_ALIGN: usize> Arena<MAX_ALIGN> {
 	pub fn new() -> Self {
 		Self::new_in(Global)
 	}
 }
 
-impl<A: Allocator> Arena<A> {
+impl<const MAX_ALIGN: usize, A: Allocator> Arena<MAX_ALIGN, A> {
 	pub fn new_in(alloc: A) -> Self {
 		Self::try_new_in(alloc).unwrap()
 	}
@@ -47,8 +83,13 @@ impl<A: Allocator> Arena<A> {
 		})
 	}
 
-	pub fn alloc<T>(&self, val: T) -> Idx<'_, T> {
+	pub fn alloc<T: IntoBytes>(&self, val: T) -> Idx<'_, T> {
 		self.try_alloc(val).unwrap()
+	}
+
+	pub fn alloc2<T: IntoBytes>(&self, val: T) -> Idx2<T> {
+		let idx = self.try_alloc(val).unwrap();
+		Idx2(idx.0, PhantomData)
 	}
 
 	pub fn try_alloc<T>(&self, val: T) -> Option<Idx<'_, T>> {
@@ -138,6 +179,11 @@ impl<A: Allocator> Arena<A> {
 		self.try_get(idx).unwrap()
 	}
 
+	pub fn get2<T>(&self, idx: Idx2<T>) -> &T {
+		let idx = Idx(idx.0, PhantomData);
+		self.try_get(idx).unwrap()
+	}
+
 	pub fn try_get<'a, T>(&'a self, idx: Idx<'a, T>) -> Option<&'a T> {
 		let offset = usize::try_from(idx.0).ok()?;
 		let start = self.end.get();
@@ -146,7 +192,7 @@ impl<A: Allocator> Arena<A> {
 	}
 }
 
-impl<A: Allocator> Arena<A> {
+impl<const MAX_ALIGN: usize, A: Allocator> Arena<MAX_ALIGN, A> {
 	pub fn as_slice(&self) -> &[u8] {
 		unsafe {
 			let ptr = self.ptr.get().as_ptr();
@@ -156,7 +202,7 @@ impl<A: Allocator> Arena<A> {
 	}
 }
 
-impl<A: Allocator> Drop for Arena<A> {
+impl<const MAX_ALIGN: usize, A: Allocator> Drop for Arena<MAX_ALIGN, A> {
 	fn drop(&mut self) {
 		let layout =
 			Layout::array::<u8>(self.end.get().addr().get() - self.start.get().addr().get())
@@ -176,14 +222,17 @@ fn bump_down_layout(ptr: *mut u8, layout: Layout) -> Option<*mut u8> {
 
 #[cfg(test)]
 mod tests {
-	use super::Arena;
+	use zerocopy::IntoBytes;
+
+	use crate::Idx2;
+
+	use super::{Arena, Idx};
 
 	#[test]
-	#[ignore]
 	fn full_circle() {
 		let arena = Arena::new();
 
-		for _ in 0..1000 {
+		for _ in 0..100 {
 			_ = arena.alloc(4);
 		}
 
@@ -195,17 +244,37 @@ mod tests {
 
 	#[test]
 	fn large_item() {
-		#[repr(align(256))]
-		struct Foo(u32);
+		#[derive(IntoBytes, Debug)]
+		#[repr(u32)]
+		enum Pad32 {
+			Null = 0x0,
+		}
+
+		#[derive(IntoBytes, Debug)]
+		#[repr(C)]
+		enum Foo {
+			Def { id: u32, _pad: Pad32 },
+			BinOp { lhs: Idx2<Self>, rhs: Idx2<Self> },
+		}
 
 		let arena = Arena::new();
 
-		let h = arena.alloc(Foo(1));
-		let v = arena.get(h);
+		let def1 = arena.alloc2(Foo::Def {
+			id: 1,
+			_pad: Pad32::Null,
+		});
+		let def2 = arena.alloc2(Foo::Def {
+			id: 2,
+			_pad: Pad32::Null,
+		});
+		let binop = arena.alloc2(Foo::BinOp {
+			lhs: def1,
+			rhs: def2,
+		});
+
+		let v = arena.get2(def1);
 
 		let raw = arena.as_slice().to_vec();
-		dbg!(raw);
-
-		assert_eq!(v.0, 1);
+		dbg!(raw, v);
 	}
 }

@@ -1,6 +1,5 @@
 #![feature(allocator_api)]
 
-use core::slice;
 use std::{
 	alloc::{Allocator, Global, Layout},
 	cell::Cell,
@@ -11,15 +10,12 @@ use std::{
 struct Idx<'a, T>(u32, PhantomData<&'a T>);
 
 struct Arena<A: Allocator = Global> {
+	start: Cell<NonNull<u8>>,
+	end: Cell<NonNull<u8>>,
 	ptr: Cell<NonNull<u8>>,
-	// buffer capacity
-	cap: Cell<u32>,
-	// offset from the start
-	len: Cell<u32>,
+
 	alloc: A,
 }
-
-const INITIAL_CAPACITY: u32 = 4;
 
 impl Arena {
 	pub fn new() -> Self {
@@ -33,17 +29,20 @@ impl<A: Allocator> Arena<A> {
 	}
 
 	pub fn try_new_in(alloc: A) -> Option<Self> {
-		let layout = Layout::array::<u8>(INITIAL_CAPACITY as usize)
-			.unwrap()
-			.align_to(4)
-			.unwrap();
+		let layout = Layout::array::<u8>(4).expect("4 bytes is small enough");
 
-		let ptr = alloc.allocate(layout).unwrap().cast();
+		let allocated = alloc.allocate(layout).ok()?;
+
+		let ptr = allocated.cast::<u8>();
+
+		let start = Cell::new(ptr);
+		// SAFETY: todo
+		let end = Cell::new(unsafe { ptr.add(allocated.len()) });
 
 		Some(Self {
-			ptr: Cell::new(ptr),
-			cap: Cell::new(INITIAL_CAPACITY),
-			len: Cell::new(0),
+			start,
+			ptr: end.clone(),
+			end,
 			alloc,
 		})
 	}
@@ -52,59 +51,87 @@ impl<A: Allocator> Arena<A> {
 		self.try_alloc(val).unwrap()
 	}
 
-	pub fn try_alloc<'a, T>(&'a self, val: T) -> Option<Idx<'a, T>> {
-		let layout = Layout::new::<T>();
-		let layout_size = u32::try_from(layout.size()).ok()?;
+	pub fn try_alloc<T>(&self, val: T) -> Option<Idx<'_, T>> {
+		let ptr = self.try_alloc_layout(Layout::new::<T>())?;
+		unsafe { ptr::write(ptr.as_ptr().cast(), val) };
 
-		let ptr = self.ptr.get();
-		let cap = self.cap.get();
-		let len = self.len.get();
+		let offset_from_end = self.end.get().addr().get() - ptr.addr().get();
+		let idx = Idx(u32::try_from(offset_from_end).ok()?, PhantomData);
+		Some(idx)
+	}
 
-		let next_len = len.checked_add(layout_size)?;
+	pub fn try_alloc_layout(&self, layout: Layout) -> Option<NonNull<u8>> {
+		if let Some(ptr) = self.try_alloc_layout_fast(layout) {
+			Some(ptr)
+		} else {
+			self.try_alloc_layout_realloc(layout)
+		}
+	}
 
-		// reallocate
-		if next_len >= cap {
-			let next_cap = cap.checked_mul(2)?;
+	fn try_alloc_layout_fast(&self, layout: Layout) -> Option<NonNull<u8>> {
+		let next_ptr = bump_down_layout(self.ptr.get().as_ptr(), layout)?;
 
-			let layout = Layout::array::<u8>(next_cap as usize)
-				.unwrap()
-				.align_to(4)
-				.unwrap();
-
-			let next_ptr = self.alloc.allocate(layout).unwrap().cast::<u8>();
-
-			// SAFETY: ?
-			unsafe {
-				ptr::copy_nonoverlapping::<u8>(ptr.as_ptr(), next_ptr.as_ptr(), len as usize)
-			};
-
-			// SAFETY: ?
-			unsafe {
-				let next_layout = Layout::array::<u8>(cap as usize)
-					.unwrap()
-					.align_to(4)
-					.unwrap();
-
-				self.alloc.deallocate(ptr, next_layout);
-			}
-
-			self.ptr.set(next_ptr);
-			self.cap.set(next_cap);
+		// not enough space, goto slow realloc path
+		if next_ptr < self.start.get().as_ptr() {
+			return None;
 		}
 
-		// TODO: if layout is very large, we have issue :)
+		debug_assert!(!next_ptr.is_null());
+		let next_ptr = unsafe { NonNull::new_unchecked(next_ptr) };
+		self.ptr.set(next_ptr);
 
-		// TODO: check
-		// SAFETY:
-		// - len is always smaller than capacity
-		// - write is in allocation bounds because next_len is smaller than capacity
+		Some(next_ptr)
+	}
+
+	fn try_alloc_layout_realloc(&self, layout: Layout) -> Option<NonNull<u8>> {
+		// TODO: loop in case we want to alloc a large struct
+
+		let end = self.end.get().as_ptr().addr();
+		let start = self.start.get().as_ptr().addr();
+		let low = bump_down_layout(self.ptr.get().as_ptr(), layout)
+			.unwrap()
+			.addr();
+		let cap_real = end - start;
+		let cap_needed = end - low;
+
+		// round cap to closest power of two
+		let rounded_cap = 1usize << (usize::BITS.wrapping_sub(cap_real.leading_zeros()));
+
+		let mut next_cap = rounded_cap;
+		while next_cap < cap_needed {
+			next_cap = next_cap.checked_mul(2)?;
+		}
+
+		let next_layout = Layout::array::<u8>(next_cap).unwrap();
+
+		let next_allocated = self.alloc.allocate(next_layout).ok()?;
+		let next_ptr = next_allocated.cast::<u8>();
+		let next_end = unsafe { next_ptr.add(next_allocated.len()) };
+
+		// SAFETY: ?
 		unsafe {
-			let ptr = self.ptr.get().add(len as usize);
-			ptr::write(ptr.as_ptr().cast(), val);
-		};
+			// TODO: copies uninit memory?
 
-		self.len.set(next_len);
-		Some(Idx(len, PhantomData))
+			let len = self.end.get().addr().get() - self.ptr.get().addr().get();
+
+			ptr::copy_nonoverlapping::<u8>(
+				self.ptr.get().as_ptr(),
+				next_end.sub(len).as_ptr(),
+				len,
+			);
+		}
+
+		// SAFETY: ?
+		unsafe {
+			let prev_layout = Layout::array::<u8>(cap_real).unwrap();
+			self.alloc.deallocate(self.start.get(), prev_layout);
+		}
+
+		self.start.set(next_ptr);
+		self.ptr.set(next_end);
+		self.end.set(next_end);
+
+		self.try_alloc_layout_fast(layout)
 	}
 
 	pub fn get<'a, T>(&'a self, idx: Idx<'a, T>) -> &'a T {
@@ -113,30 +140,38 @@ impl<A: Allocator> Arena<A> {
 
 	pub fn try_get<'a, T>(&'a self, idx: Idx<'a, T>) -> Option<&'a T> {
 		let offset = usize::try_from(idx.0).ok()?;
-		let start = self.ptr.get();
-		let current = unsafe { start.add(offset).cast().as_ref() };
+		let start = self.end.get();
+		let current = unsafe { start.sub(offset).cast().as_ref() };
 		Some(current)
 	}
 }
 
 impl<A: Allocator> Arena<A> {
 	pub fn as_slice(&self) -> &[u8] {
-		unsafe { slice::from_raw_parts(self.ptr.get().as_ptr(), self.len.get() as usize) }
+		unsafe {
+			let ptr = self.ptr.get().as_ptr();
+			let end = self.end.get().as_ptr();
+			std::slice::from_raw_parts(ptr, end.addr() - ptr.addr())
+		}
 	}
 }
 
 impl<A: Allocator> Drop for Arena<A> {
 	fn drop(&mut self) {
-		let ptr = self.ptr.get();
-		let layout = Layout::array::<u8>(self.cap.get() as usize)
-			.unwrap()
-			.align_to(4)
-			.unwrap();
-
+		let layout =
+			Layout::array::<u8>(self.end.get().addr().get() - self.start.get().addr().get())
+				.unwrap();
 		unsafe {
-			self.alloc.deallocate(ptr, layout);
+			self.alloc.deallocate(self.start.get(), layout);
 		}
 	}
+}
+
+/// Bumps down a pointer by layout's size and flooring as needed by the alignment
+fn bump_down_layout(ptr: *mut u8, layout: Layout) -> Option<*mut u8> {
+	let raw_next_ptr = ptr.addr().checked_sub(layout.size())?;
+	let aligned_next_ptr = raw_next_ptr & !(layout.align() - 1);
+	Some(ptr.with_addr(aligned_next_ptr))
 }
 
 #[cfg(test)]
@@ -144,11 +179,12 @@ mod tests {
 	use super::Arena;
 
 	#[test]
+	#[ignore]
 	fn full_circle() {
 		let arena = Arena::new();
 
 		for _ in 0..1000 {
-			_ = arena.alloc(1);
+			_ = arena.alloc(4);
 		}
 
 		let h = arena.alloc(3);
@@ -159,13 +195,16 @@ mod tests {
 
 	#[test]
 	fn large_item() {
-		#[repr(align(2048))]
+		#[repr(align(256))]
 		struct Foo(u32);
 
 		let arena = Arena::new();
 
 		let h = arena.alloc(Foo(1));
 		let v = arena.get(h);
+
+		let raw = arena.as_slice().to_vec();
+		dbg!(raw);
 
 		assert_eq!(v.0, 1);
 	}

@@ -97,6 +97,11 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 	}
 
 	pub fn try_alloc<T: KnownLayout + Immutable + IntoBytes>(&mut self, val: T) -> Option<Idx<T>> {
+		assert!(
+			!std::mem::needs_drop::<T>(),
+			"value will not be dropped, maybe use ManuallyDrop?"
+		);
+
 		// SAFETY: we immediately write to the given pointer
 		let ptr = unsafe { self.try_alloc_layout(Layout::new::<T>())? };
 		// SAFETY: the pointer is allocated for the exact layout of T
@@ -336,7 +341,7 @@ mod tests {
 			assert_eq!(e3, *v3);
 		}
 
-		print_memory_formatted(arena.as_slice());
+		// print_memory_formatted(arena.as_slice());
 	}
 
 	#[test]
@@ -345,6 +350,23 @@ mod tests {
 		let mut arena = Arena::<1, 1>::default();
 
 		let _h = arena.alloc(0u16);
+	}
+
+	#[test]
+	#[should_panic]
+	fn alloc_needs_drop_fail() {
+		let mut arena = Arena::<1, 1>::default();
+
+		#[derive(Debug, KnownLayout, Immutable, IntoBytes, TryFromBytes)]
+		struct Foo;
+
+		impl Drop for Foo {
+			fn drop(&mut self) {
+				todo!()
+			}
+		}
+
+		let _h = arena.alloc(Foo);
 	}
 
 	#[test]

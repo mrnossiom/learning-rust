@@ -9,6 +9,9 @@ use std::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
+#[derive(Debug)]
+pub struct ArenaErr;
+
 #[derive(IntoBytes, FromBytes, KnownLayout, Immutable)]
 #[repr(transparent)]
 pub struct Idx<T>(u32, PhantomData<fn() -> T>);
@@ -96,7 +99,10 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 		self.try_alloc(val).unwrap()
 	}
 
-	pub fn try_alloc<T: KnownLayout + Immutable + IntoBytes>(&mut self, val: T) -> Option<Idx<T>> {
+	pub fn try_alloc<T: KnownLayout + Immutable + IntoBytes>(
+		&mut self,
+		val: T,
+	) -> Result<Idx<T>, ArenaErr> {
 		assert!(
 			!std::mem::needs_drop::<T>(),
 			"value will not be dropped, maybe use ManuallyDrop?"
@@ -107,20 +113,21 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 		// SAFETY: the pointer is allocated for the exact layout of T
 		unsafe { ptr::write(ptr.as_ptr().cast(), val) };
 
-		let offset_from_end = self.end.addr().get() - ptr.addr().get();
-		let idx = Idx(u32::try_from(offset_from_end).ok()?, PhantomData);
-		Some(idx)
+		let backward_offset = self.end.addr().get() - ptr.addr().get();
+		let backward_offset = u32::try_from(backward_offset).map_err(|_| ArenaErr)?;
+		let idx = Idx(backward_offset, PhantomData);
+		Ok(idx)
 	}
 
 	/// # Safety
 	///
 	/// The returned pointer needs to be written to before any serialization function is used.
-	pub unsafe fn try_alloc_layout(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+	pub unsafe fn try_alloc_layout(&mut self, layout: Layout) -> Result<NonNull<u8>, ArenaErr> {
 		assert!(layout.align() >= MIN_ALIGN, "alignment is too small");
 		assert!(layout.align() <= MAX_ALIGN, "alignment is too large");
 
 		if let Some(ptr) = self.try_alloc_layout_fast(layout) {
-			Some(ptr)
+			Ok(ptr)
 		} else {
 			self.try_alloc_layout_realloc(layout)
 		}
@@ -134,14 +141,13 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 			return None;
 		}
 
-		debug_assert!(!next_ptr.is_null());
 		let next_ptr = unsafe { NonNull::new_unchecked(next_ptr) };
 		self.ptr = next_ptr;
 
 		Some(next_ptr)
 	}
 
-	fn try_alloc_layout_realloc(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+	fn try_alloc_layout_realloc(&mut self, layout: Layout) -> Result<NonNull<u8>, ArenaErr> {
 		let end = self.end.as_ptr().addr();
 		let start = self.start.as_ptr().addr();
 		let low = bump_down_layout(self.ptr.as_ptr(), layout).unwrap().addr();
@@ -151,7 +157,7 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 
 		let mut next_cap = cap_real.next_power_of_two();
 		while next_cap < cap_needed {
-			next_cap = next_cap.checked_mul(2)?;
+			next_cap = next_cap.checked_mul(2).ok_or(ArenaErr)?;
 		}
 
 		let next_layout = Layout::array::<u8>(next_cap)
@@ -159,7 +165,10 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 			.align_to(MAX_ALIGN)
 			.unwrap();
 
-		let next_allocated = self.alloc.allocate_zeroed(next_layout).ok()?;
+		let next_allocated = self
+			.alloc
+			.allocate_zeroed(next_layout)
+			.map_err(|_| ArenaErr)?;
 		let next_start = next_allocated.cast::<u8>();
 		// SAFETY: we add the length of the allocation which is in bounds
 		let next_end = unsafe { next_start.add(next_allocated.len()) };
@@ -194,7 +203,7 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 		self.ptr = next_current;
 		self.end = next_end;
 
-		self.try_alloc_layout_fast(layout)
+		self.try_alloc_layout_fast(layout).ok_or(ArenaErr)
 	}
 
 	#[inline(always)]
@@ -202,10 +211,13 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 		self.try_get(idx).unwrap()
 	}
 
-	pub fn try_get<T: KnownLayout + Immutable + FromBytes>(&self, idx: Idx<T>) -> Option<&T> {
+	pub fn try_get<T: KnownLayout + Immutable + FromBytes>(
+		&self,
+		idx: Idx<T>,
+	) -> Result<&T, ArenaErr> {
 		let ptr = self.try_get_ptr(idx)?;
 		let source = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), Layout::new::<T>().size()) };
-		<T as FromBytes>::ref_from_bytes(source).ok()
+		<T as FromBytes>::ref_from_bytes(source).map_err(|_| ArenaErr)
 	}
 
 	#[inline(always)]
@@ -216,17 +228,17 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 	pub fn try_get_partial<T: KnownLayout + Immutable + TryFromBytes>(
 		&self,
 		idx: Idx<T>,
-	) -> Option<&T> {
+	) -> Result<&T, ArenaErr> {
 		let ptr = self.try_get_ptr(idx)?;
 		let source = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), Layout::new::<T>().size()) };
-		<T as TryFromBytes>::try_ref_from_bytes(source).ok()
+		<T as TryFromBytes>::try_ref_from_bytes(source).map_err(|_| ArenaErr)
 	}
 
 	#[inline(always)]
-	pub fn try_get_ptr<T>(&self, idx: Idx<T>) -> Option<NonNull<u8>> {
-		let offset = usize::try_from(idx.0).ok()?;
+	pub fn try_get_ptr<T>(&self, idx: Idx<T>) -> Result<NonNull<u8>, ArenaErr> {
+		let offset = usize::try_from(idx.0).map_err(|_| ArenaErr)?;
 		let ptr = unsafe { self.end.sub(offset).cast() };
-		Some(ptr)
+		Ok(ptr)
 	}
 }
 
@@ -236,9 +248,8 @@ impl<const MIN_ALIGN: usize, const MAX_ALIGN: usize, A: Allocator> Arena<MIN_ALI
 		// - values written in the range implement the trait `zerocopy::IntoBytes`
 		// - (WIP) when rounding down the pointer for alignment, we can create holes of uninit data
 		unsafe {
-			let ptr = self.ptr.as_ptr();
-			let end = self.end.as_ptr();
-			std::slice::from_raw_parts(ptr, end.addr() - ptr.addr())
+			let len = self.end.as_ptr().addr() - self.ptr.addr().get();
+			std::slice::from_raw_parts(self.ptr.as_ptr(), len)
 		}
 	}
 }

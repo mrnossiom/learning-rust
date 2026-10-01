@@ -1,4 +1,3 @@
-#![feature(allocator_api)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use core::fmt;

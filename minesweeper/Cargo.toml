@@ -1,0 +1,9 @@
+[package]
+name = "minesweeper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+calloop = { version = "0.14", features = ["nix", "signals"] }
+nix = { version = "0.31", features = ["ioctl", "term"] }
+rand = "0.10"
